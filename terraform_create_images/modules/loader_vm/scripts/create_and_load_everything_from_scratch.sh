@@ -5,6 +5,8 @@
 export ES_HOST="${ES_HOST:-localhost}"
 export CLICKHOUSE_HOST="${CLICKHOUSE_HOST:-localhost}"
 export SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+export data_path="${DATA_PATH:-/tmp/data/outputs}"
+export cpu_count="${CPU_COUNT:-$(nproc --all)}"
 
 if [ $# -ne 1 ]; then
   echo "Recreates ot database and loads data."
@@ -12,8 +14,6 @@ if [ $# -ne 1 ]; then
   exit 1
 fi
 GS_DATA="${1}"
-data_path="/tmp/data"
-cpu_count=$(nproc --all)
 echo "${cpu_count} CPUs available for parallelisation."
 
 gsutil -m cp -r $GS_DATA $data_path &>/dev/null
@@ -55,16 +55,15 @@ load_foreach_parquet() {
 load_json_for_elastic() {
   local data_path=$1
   local index=$2
-  local index_file=$3
   echo "[Elasticsearch] Loading $data_path into $index"
   for f in ${data_path}/part-*.json; do
-    cat $f | esbulk -0 -server localhost:9200 -index $index -size 2000 -w $(expr $cpu_count / 2)
+    cat $f | esbulk -0 -server ${ES_HOST}:9200 -index $index -size 2000 -w $(expr $cpu_count / 2)
   done
 }
 
 ## Database setup
 echo "Initialising database..."
-clickhouse-client --query="drop database if exists ot;"
+clickhouse-client -h ${CLICKHOUSE_HOST} --query="drop database if exists ot;"
 
 intermediateTables=(
   studies
@@ -77,20 +76,18 @@ intermediateTables=(
   v2d_sa_molecular_trait
   l2g
   manhattan
-  v2g_scored
-  d2v2g_scored
 )
 ## Create intermediary tables
 for t in "${intermediateTables[@]}"; do
   echo "[Clickhouse] Creating intermediary table: ${t}_log"
-  clickhouse-client -m -n <"${SCRIPT_DIR}/${t}_log.sql"
+  clickhouse-client -h ${CLICKHOUSE_HOST} -m -n <"${SCRIPT_DIR}/${t}_log.sql"
 done
 
 echo "[Elasticsearch] Create indexes"
 for idx in studies genes variants; do
-  curl -XDELETE localhost:9200/$idx &>/dev/null
-  echo "[Elasticsearch] Create index localhost:9200/$idx with settings file $SCRIPT_DIR/index_settings_$idx.json"
-  curl -XPUT -H 'Content-Type: application/json' --data @$SCRIPT_DIR/index_settings_$idx.json localhost:9200/$idx
+  curl -XDELETE ${ES_HOST}:9200/$idx &>/dev/null
+  echo "[Elasticsearch] Create index ${ES_HOST}:9200/$idx with settings file $SCRIPT_DIR/index_settings_$idx.json"
+  curl -XPUT -H 'Content-Type: application/json' --data @$SCRIPT_DIR/index_settings_$idx.json ${ES_HOST}:9200/$idx
 done
 
 ## Load data
@@ -98,13 +95,15 @@ done
 ### lots of concurrent loading is happening. Load all the d2v2g data in first
 ### and then push everything else in behind it.
 halfCPU=$(expr $cpu_count / 2)
-quarterCPU=$(expr $cpu_count / 4)
 
 {
   echo "--- D2V2G SCORED START ---"
 
+  echo "[Clickhouse] Creating intermediary table: d2v2g_scored_log"
+  clickhouse-client -h ${CLICKHOUSE_HOST} -m -n <"${SCRIPT_DIR}/clickhouse/sql/d2v2g_scored_log.sql"
+
   echo "[Clickhouse] Loading d2v2g_scored to log table."
-  load_foreach_parquet "${data_path}/outputs/d2v2g_scored" "ot.d2v2g_scored_log" $halfCPU
+  load_foreach_parquet "${data_path}/d2v2g_scored" "ot.d2v2g_scored_log" $halfCPU
 
   clickhouse-client -h "${CLICKHOUSE_HOST}" -m -n <"${SCRIPT_DIR}/d2v2g_scored.sql"
   echo "[Clickhouse] Done loading d2v2g_scored."
@@ -116,31 +115,23 @@ quarterCPU=$(expr $cpu_count / 4)
 } &
 {
   echo "[Elasticsearch] load studies data"
-  load_json_for_elastic \
-    "${data_path}/outputs/search/study" \
-    studies \
-    "${SCRIPT_DIR}/index_settings_studies.json"
-
+  load_json_for_elastic "${data_path}/search/study" studies
 } &
 {
   echo "[Elasticsearch] load genes data"
-  load_json_for_elastic \
-    "${data_path}/outputs/search/gene" \
-    genes \
-    "${SCRIPT_DIR}/index_settings_genes.json"
+  load_json_for_elastic "${data_path}/search/gene" genes
 } &
 {
-  echo "[Elasticsearch] load genes data"
-  load_json_for_elastic \
-    "${data_path}/outputs/search/variant" \
-    variants \
-    "${SCRIPT_DIR}/index_settings_variants.json"
+  echo "[Elasticsearch] load variants data"
+  load_json_for_elastic "${data_path}/search/variant" variants
 } &
 wait
 
 echo "--- V2G SCORED START ---"
+echo "[Clickhouse] Creating intermediary table: v2g_scored_log"
+clickhouse-client -h ${CLICKHOUSE_HOST} -m -n <"${SCRIPT_DIR}/clickhouse/sql/v2g_scored_log.sql"
 echo "[Clickhouse] Loading v2g_scored to log table."
-load_foreach_parquet "${data_path}/outputs/v2g_scored" "ot.v2g_scored_log" $halfCPU
+load_foreach_parquet "${data_path}/v2g_scored" "ot.v2g_scored_log" $halfCPU
 clickhouse-client -h "${CLICKHOUSE_HOST}" -m -n <"${SCRIPT_DIR}/v2g_scored.sql"
 echo "Create v2g structure"
 clickhouse-client -h "${CLICKHOUSE_HOST}" -m -n <"${SCRIPT_DIR}/v2g_structure.sql"
@@ -149,25 +140,25 @@ echo "Deleting intermediate table: v2g_scored_log"
 clickhouse-client -h "${CLICKHOUSE_HOST}" -m -n -q " drop table ot.v2g_scored_log"
 echo "--- V2G SCORED END ---"
 
-load_foreach_parquet "${data_path}/outputs/sa/gwas" "ot.v2d_sa_gwas_log" $halfCPU
+load_foreach_parquet "${data_path}/sa/gwas" "ot.v2d_sa_gwas_log" $halfCPU
 clickhouse-client -h "${CLICKHOUSE_HOST}" -m -n <"${SCRIPT_DIR}/v2d_sa_gwas.sql"
 echo "[Clickhouse] Done loading v2d_sa_gwas table."
 
-load_foreach_parquet "${data_path}/outputs/sa/molecular_trait" "ot.v2d_sa_molecular_trait_log" $halfCPU
+load_foreach_parquet "${data_path}/sa/molecular_trait" "ot.v2d_sa_molecular_trait_log" $halfCPU
 clickhouse-client -h "${CLICKHOUSE_HOST}" -m -n <"${SCRIPT_DIR}/v2d_sa_molecular_trait.sql"
 echo "[Clickhouse] Done loading v2d_sa_molecular_trait table."
 
-load_foreach_parquet "${data_path}/outputs/lut/study-index" "ot.studies_log" $halfCPU
-load_foreach_parquet "${data_path}/outputs/lut/overlap-index" "ot.studies_overlap_log" $halfCPU
-load_foreach_parquet "${data_path}/outputs/lut/variant-index" "ot.variants_log" $halfCPU
-load_foreach_parquet "${data_path}/outputs/v2d" "ot.v2d_log" $halfCPU
-load_foreach_parquet "${data_path}/outputs/v2d_coloc" "ot.v2d_coloc_log" $halfCPU
-load_foreach_parquet "${data_path}/outputs/v2d_credset" "ot.v2d_credset_log" $halfCPU
-load_foreach_parquet "${data_path}/outputs/l2g" "ot.l2g_log" $halfCPU
-load_foreach_parquet "${data_path}/outputs/manhattan" "ot.manhattan_log" $halfCPU
+load_foreach_parquet "${data_path}/lut/study-index" "ot.studies_log" $halfCPU
+load_foreach_parquet "${data_path}/lut/overlap-index" "ot.studies_overlap_log" $halfCPU
+load_foreach_parquet "${data_path}/lut/variant-index" "ot.variants_log" $halfCPU
+load_foreach_parquet "${data_path}/v2d" "ot.v2d_log" $halfCPU
+load_foreach_parquet "${data_path}/v2d_coloc" "ot.v2d_coloc_log" $halfCPU
+load_foreach_parquet "${data_path}/v2d_credset" "ot.v2d_credset_log" $halfCPU
+load_foreach_parquet "${data_path}/l2g" "ot.l2g_log" $halfCPU
+load_foreach_parquet "${data_path}/manhattan" "ot.manhattan_log" $halfCPU
 echo "Load gene index"
 clickhouse-client -h "${CLICKHOUSE_HOST}" -m -n <"${SCRIPT_DIR}/genes.sql"
-load_foreach_parquet "${data_path}/outputs/lut/genes-index" "ot.genes" $halfCPU
+load_foreach_parquet "${data_path}/lut/genes-index" "ot.genes" $halfCPU
 
 clickhouse-client -h "${CLICKHOUSE_HOST}" -m -n <"${SCRIPT_DIR}/v2d_coloc.sql"
 echo "[Clickhouse] Done loading final v2d_coloc from log table."
