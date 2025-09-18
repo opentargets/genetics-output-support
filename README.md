@@ -1,3 +1,7 @@
+> [!IMPORTANT]
+> This repository is archived. Open Targets Genetics is now merged into Platform.
+> This process has now been taken over by [POS](https://github.com/opentargets/platform-output-support).
+
 # Open Targets: Genetics-output-support overview
 
 Genetics Output Support (POS) provides tools to prepare the Genetics data for public distribution. Distribution is either part of the public facing web portal, or through GCP Bigquery.
